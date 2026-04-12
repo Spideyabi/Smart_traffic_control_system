@@ -1,0 +1,112 @@
+AI AUTONOMOUS TRAFFIC CONTROL SYSTEM - DETAILED MODULE EXPLANATION
+===================================================================
+
+This document provides an in-depth, low-level technical explanation of every functional module within the Smart Traffic Control System. The architecture is broadly separated into a Python-based backend that handles intensive computer vision tasks, AI traffic light logic, and API management, and a React-based frontend providing a robust real-time graphical interface.
+
+-------------------------------------------------------------------
+PART 1: BACKEND MODULES (Python / FastAPI)
+-------------------------------------------------------------------
+The core intelligence of the system resides in the backend. It ingests video feeds, applies object detection algorithms, calculates vehicle density, and logically manages the traffic light phases based on these metrics.
+
+1.1 CORE ENTRY POINTS
+---------------------
+* server.py
+  - Purpose: Serves as the central API engine and WebSocket server utilizing FastAPI.
+  - Detailed Functionality:
+    - Provides REST API endpoints (e.g., `/api/start`, `/api/stop`, `/api/signal_mode`) enabling external control of the pipeline and traffic logic modes.
+    - Manages an asynchronous background task (`_broadcast_loop`) that constantly pushes AI decisions, traffic signal states, and vehicle density updates directly to connected web clients via WebSockets.
+    - Uses the Python `yield` pattern in an HTTP StreamingResponse (`_mjpeg_generator`) to endlessly pipe processed, annotated video frames (with bounding boxes) back to the dashboard as a true Live Video Feed.
+    - Mediates manual overrides initiated by the user interface, injecting manual signal priorities into the traffic controller logic.
+
+* main.py
+  - Purpose: Serves as the Heavy-Duty Video Processing Pipeline.
+  - Detailed Functionality:
+    - Employs a robust Producer-Consumer Multi-threading architecture to keep the video stream natively smooth (e.g., 25fps) without judder, regardless of inference latency.
+    - Producer Threads: Rapidly decode incoming video files frame-by-frame. When it's time to detect vehicles, they offload batches to a ThreadPoolExecutor where the YOLO model operates.
+    - Synchronization Pacer: Holds the heavily annotated frames in a Queue (`_output_queue`). A "pacer" thread pops them strictly locked to the video's original frame rate, ensuring a silky-smooth dashboard replay experience. 
+    - Combines outputs from lane detection, tracking logic, and object bounding boxes to draw overlays on the video images using OpenCV prior to dispatch.
+
+1.2 AI AND TRAFFIC CONTROLLERS (/backend/src/controllers/)
+----------------------------------------------------------
+* density_controller.py
+  - Purpose: The core autonomous decision-making engine for the traffic lights.
+  - Detailed Functionality:
+    - AI Density Scoring: Collects vehicle density counts for all four geographical directions (NORTH, SOUTH, EAST, WEST).
+    - Starvation Guard: Operates an internal clock to prevent lanes with minor traffic from waiting indefinitely. If an occupied lane waits more than 120 seconds (the `STARVATION_SECS` parameter), it is forcibly assigned the next Green Light cycle.
+    - Emergency Priority: Monitors an ambulance trigger boolean. If an ambulance is flagged, it preemptively skips standard routines and holds the Green phase on that specific lane until the ambulance has successfully cleared. Includes revert-logic so the system remembers who was about to turn Green before the emergency.
+    - Green Time Calculation: Uses a mathematical formula shifting times between 5.0s (min) to 18.0s (max) depending precisely on the live count returned directly by the system tracking data.
+    - Logs decisions deeply, formatting `reason`, `confidence` score, and exact time limits to the UI.
+
+* time_based_controller.py
+  - Purpose: Standard "dumb" traffic light controller fallback.
+  - Detailed Functionality: Simply loops in a clockwise deterministic layout allocating a pre-configured, hardcoded duration for Green, Amber, and Red clearance times oblivious to road density.
+
+1.3 OBJECT DETECTION & TRACKING (/backend/src/detection/)
+---------------------------------------------------------
+* vehicle_detector.py
+  - Purpose: Implementation of the YOLOv8 Object Detection algorithm.
+  - Detailed Functionality: Loads `yolov8m.pt` (medium weights configuration). It batches numpy array frames together and forwards them directly to the PyTorch/Ultralytics backend. Uses Non-Maximum Suppression (NMS) to eliminate duplicate bounding boxes around the same vehicle.
+  - Enforces Confidence thresholds and Intersection over Union (IoU) constraints loaded from global configuration.
+
+* tracker.py
+  - Purpose: Cross-frame stability tracking (Centroid Tracking).
+  - Detailed Functionality: Object detection (YOLO) only specifies *where* cars are on a specific frame, oblivious to the fact that it is the *same* car across multiple frames. The Centroid Tracker plots the geometric centers (centroids) of bounding boxes and calculates Euclidean distances frame-to-frame. 
+  - Assigns unique `track_id` numbers. If an object vanishes for a certain period, it purges its ID memory to prevent phantom vehicles inside density calculations.
+
+1.4 IMAGE PROCESSING & MASKING (/backend/src/processing/)
+---------------------------------------------------------
+* lane_detector.py
+  - Purpose: Automatic isolation of oncoming vs departing traffic.
+  - Detailed Functionality: Instead of using hard-coded regions, the system tracks vehicles for an automatic calibration period, examining movement vectors (i.e., whether Y-coordinates are growing or shrinking), isolating the lane representing actual waiting incoming traffic.
+  - Employs OpenCV polygon geometry to build the dynamic Regions of Interest.
+
+* road_filter.py
+  - Purpose: Noise reduction filter.
+  - Detailed Functionality: Applies geometric masks to zero-out areas outside the detected lane. It mathematically checks if the center point of any detected vehicle resides inside the lane mask using Point-in-Polygon logic (`cv2.pointPolygonTest`). Ensures the AI does not count parked cars near the curbs or cars driving away from the intersection.
+
+* tramac_fast_scnn.py
+  - Purpose: Segmentation mapping.
+  - Detailed Functionality: Implements a Fast Spatial Convolutional Neural Network structure tailored directly for extracting continuous road boundaries versus non-road surroundings across an image surface, heavily complementing standard bounding-box logic to understand scene shapes.
+
+1.5 I/O, DATABASE, & UTILITIES (/backend/src/ etc.)
+---------------------------------------------------
+* database/db_manager.py: Connects to a persistent SQLite database (`traffic_data.db`). Uses asynchronous-friendly inserts to log volume counts per-second per-lane alongside density occupancies, allowing long-term historical audits.
+* trafic_predictor.py: A historical analysis controller aimed at interpolating and forecasting expected vehicle spikes based directly on logged trends, capable of heavily influencing wait-times in future conditions. 
+* config/settings.py: Contains hardcoded tuning knobs such as global confidence constraints limits (default 0.35 IoU), frame dimension scaling defaults (`WINDOW_HEIGHT`/`WIDTH`), and path pointers.
+
+-------------------------------------------------------------------
+PART 2: FRONTEND MODULES (React / Vite)
+-------------------------------------------------------------------
+The Frontend operates as the command-center console for the ecosystem, using modern React architectures and 3D WebGL visualizations to represent the complex math flowing from the Backend API.
+
+2.1 CORE APPLICATION STRUCTURE
+------------------------------
+* src/App.jsx
+  - Purpose: Root State Manager and Dashboard Router.
+  - Detailed Functionality: 
+    - Upon mounting, opens a raw WebSocket channel to `/ws/logs` via the Backend API. 
+    - Handles incoming payload arrays structured as React hooks (`useState`), translating `signal_update` text blocks into discrete logic integers representing wait timers, current lane signals, and error messages.
+    - Exposes master playback hooks (`start()`, `stop()`), relaying operator actions directly to API endpoints, dictating the entire Python inference process.
+
+2.2 DASHBOARD VIEWS
+-------------------
+* src/LiveFeedTab.jsx
+  - Purpose: Renders the active analytical MJPEG feed.
+  - Detailed Functionality: Links an HTML `<img>` tag directly to the `/api/video` pipeline endpoints. Wraps stream controllers, allowing an operator to monitor the exact bounding boxes and detection overlays generated from the `main.py` pipeline at full resolution, coupled synchronously to text log analytics arriving over the socket.
+
+* src/PredictionTab.jsx
+  - Purpose: Deep metric analysis and decision traceability module.
+  - Detailed Functionality: Ingests the `predicted` values and current capacities over time. Employs charting libraries (typically Recharts or Chart.js) to render curves showcasing potential density vs pure reality. Highly focuses on AI decision transparency (i.e. 'Why did the AI turn West green? Answer: Because wait-time eclipsed 120s.')
+
+* src/SimulatorTab.jsx
+  - Purpose: The wrapper pane for the "Digital Twin" traffic intersection.
+  - Detailed Functionality: Encompasses simulation settings (Force Mode: AI vs Manual overrides), toggle grids for simulated ambulances, and acts as the contextual frame that passes down current traffic volumes and signal timers strictly into the 3D rendering pipeline.
+
+* src/TrafficScene.jsx
+  - Purpose: The High-Fidelity 3D WebGL Driver (React Three Fiber).
+  - Detailed Functionality: Transposes physical coordinates provided by the backend to actual 3D visual coordinates inside the browser.
+    - Cars: Maps moving car instances along vector axes that correspond physically to the directional vectors tracked by YOLO.
+    - Signal Poles: Renders volumetric lighting (Green/Amber/Red geometries) changing dynamically reflecting the strict signals provided by `density_controller.py`.  
+    - Implements dynamic object staging, shadows, camera orientations, and scene graphs directly without the overhead of the video stream.
+
+Both stacks interoperate to produce a completely autonomous, responsive, and observable modern intelligent traffic management solution.
